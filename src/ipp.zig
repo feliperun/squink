@@ -2,7 +2,7 @@
 //! for attributes. Binary encoding, HTTP/1.1 POST over TCP or a Unix socket, with a
 //! hard deadline. No dependencies.
 const std = @import("std");
-const posix = std.posix;
+const sys = @import("sys.zig");
 
 pub const op = struct {
     pub const get_job_attributes: u16 = 0x0009;
@@ -250,38 +250,26 @@ pub fn call(
     return parse(gpa, payload) catch error.InvalidIpp;
 }
 
-fn connect(endpoint: Endpoint, deadline: i64) Error!posix.fd_t {
-    const addr = switch (endpoint) {
-        .tcp => |t| std.net.Address.initIp4(t.ip, t.port),
-        .unix => |p| std.net.Address.initUnix(p) catch return error.ConnectFailed,
-    };
-    const fd = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch
-        return error.ConnectFailed;
-    errdefer posix.close(fd);
-    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |e| switch (e) {
-        error.WouldBlock => {
-            try waitFor(fd, posix.POLL.OUT, deadline);
-            posix.getsockoptError(fd) catch return error.ConnectFailed;
-        },
-        else => return error.ConnectFailed,
-    };
-    return fd;
+fn connect(endpoint: Endpoint, deadline: i64) Error!sys.Fd {
+    return switch (endpoint) {
+        .tcp => |t| sys.connectTcp(t.ip, t.port, deadline),
+        .unix => |p| sys.connectUnix(p, deadline),
+    } catch |e| if (e == error.Timeout) error.Timeout else error.ConnectFailed;
 }
 
 fn exchangePlain(gpa: std.mem.Allocator, endpoint: Endpoint, request: []const u8, timeout_ms: i64) Error![]const u8 {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
+    const deadline = sys.milliTimestamp() + timeout_ms;
     const fd = try connect(endpoint, deadline);
-    defer posix.close(fd);
-    try sendAll(fd, request, deadline);
+    defer sys.close(fd);
+    sys.writeAll(fd, request, deadline) catch |e| return if (e == error.Timeout) error.Timeout else error.ConnectFailed;
 
     var raw: std.ArrayList(u8) = .empty;
     var buf: [16 * 1024]u8 = undefined;
     while (true) {
-        try waitFor(fd, posix.POLL.IN, deadline);
-        const n = posix.read(fd, &buf) catch |e| switch (e) {
-            error.WouldBlock => continue,
+        const n = sys.read(fd, &buf, deadline) catch |e| switch (e) {
+            error.Timeout => return error.Timeout,
             // A printer that wants TLS may reset right after its 426 answer.
-            error.ConnectionResetByPeer => break,
+            error.ConnectionReset => break,
             else => return error.ConnectFailed,
         };
         if (n == 0) break;
@@ -295,32 +283,26 @@ fn exchangePlain(gpa: std.mem.Allocator, endpoint: Endpoint, request: []const u8
 
 fn exchangeTls(gpa: std.mem.Allocator, ip: [4]u8, port: u16, request: []const u8, timeout_ms: i64) Error![]const u8 {
     const tls = std.crypto.tls;
-    const deadline = std.time.milliTimestamp() + timeout_ms;
+    const deadline = sys.milliTimestamp() + timeout_ms;
     const fd = try connect(.{ .tcp = .{ .ip = ip, .port = port } }, deadline);
-    defer posix.close(fd);
+    defer sys.close(fd);
 
-    // The TLS client does blocking I/O: switch the socket back to blocking and bound
-    // every read and write with socket timeouts instead.
-    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return error.ConnectFailed;
-    const nonblock: usize = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
-    _ = posix.fcntl(fd, posix.F.SETFL, flags & ~nonblock) catch return error.ConnectFailed;
-    const tv: posix.timeval = .{ .sec = @intCast(@divTrunc(timeout_ms, 1000)), .usec = @intCast(@mod(timeout_ms, 1000) * 1000) };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
-
-    const stream: std.net.Stream = .{ .handle = fd };
     const bufs = gpa.alloc(u8, 4 * tls.Client.min_buffer_len) catch return error.OutOfMemory;
     const n = tls.Client.min_buffer_len;
-    var sock_r = stream.reader(bufs[0..n]);
-    var sock_w = stream.writer(bufs[n .. 2 * n]);
-    var client = tls.Client.init(sock_r.interface(), &sock_w.interface, .{
+    var sock_r = sys.SocketReader.init(fd, deadline, bufs[0..n]);
+    var sock_w = sys.SocketWriter.init(fd, deadline, bufs[n .. 2 * n]);
+    var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+    sys.randomBytes(&entropy);
+    var client = tls.Client.init(&sock_r.interface, &sock_w.interface, .{
         .host = .no_verification,
         .ca = .no_verification,
         .read_buffer = bufs[2 * n .. 3 * n],
         .write_buffer = bufs[3 * n ..],
+        .entropy = &entropy,
+        .realtime_now = std.Io.Timestamp.now(sys.io, .real),
         // HTTP's Content-Length / chunked framing detects truncation.
         .allow_truncation_attacks = true,
-    }) catch return error.TlsFailed;
+    }) catch return if (timedOut(sock_r.err) or timedOut(sock_w.err)) error.Timeout else error.TlsFailed;
 
     client.writer.writeAll(request) catch return error.TlsFailed;
     client.writer.flush() catch return error.TlsFailed;
@@ -328,10 +310,12 @@ fn exchangeTls(gpa: std.mem.Allocator, ip: [4]u8, port: u16, request: []const u8
 
     var raw: std.ArrayList(u8) = .empty;
     while (!httpComplete(raw.items)) {
-        if (std.time.milliTimestamp() > deadline) return error.Timeout;
         client.reader.fillMore() catch |e| switch (e) {
             error.EndOfStream => break,
-            else => return if (raw.items.len > 0) error.InvalidHttp else error.TlsFailed,
+            else => {
+                if (timedOut(sock_r.err)) return error.Timeout;
+                return if (raw.items.len > 0) error.InvalidHttp else error.TlsFailed;
+            },
         };
         const got = client.reader.buffered();
         raw.appendSlice(gpa, got) catch return error.OutOfMemory;
@@ -341,23 +325,8 @@ fn exchangeTls(gpa: std.mem.Allocator, ip: [4]u8, port: u16, request: []const u8
     return raw.items;
 }
 
-fn waitFor(fd: posix.fd_t, events: i16, deadline: i64) Error!void {
-    const left = deadline - std.time.milliTimestamp();
-    if (left <= 0) return error.Timeout;
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
-    const n = posix.poll(&fds, @intCast(left)) catch return error.ConnectFailed;
-    if (n == 0) return error.Timeout;
-}
-
-fn sendAll(fd: posix.fd_t, data: []const u8, deadline: i64) Error!void {
-    var sent: usize = 0;
-    while (sent < data.len) {
-        try waitFor(fd, posix.POLL.OUT, deadline);
-        sent += posix.write(fd, data[sent..]) catch |e| switch (e) {
-            error.WouldBlock => 0,
-            else => return error.ConnectFailed,
-        };
-    }
+fn timedOut(e: ?sys.Error) bool {
+    return if (e) |err| err == error.Timeout else false;
 }
 
 const Http = struct { status: u16, headers: []const u8, body: []const u8 };
@@ -435,15 +404,18 @@ fn dechunk(gpa: std.mem.Allocator, body: []const u8) Error![]const u8 {
 
 // ---------------------------------------------------------------------- CUPS
 
+/// Where cupsd listens locally: Debian/Ubuntu, and macOS.
+const cups_socket = if (sys.is_darwin) "/private/var/run/cupsd" else "/run/cups/cups.sock";
+
 /// Sends a request to the local CUPS scheduler: its Unix socket first, then
 /// localhost:631.
 pub fn cups(gpa: std.mem.Allocator, body: []const u8) Error!Response {
-    return call(gpa, .{ .unix = "/run/cups/cups.sock" }, "localhost", "/", body, 5000) catch
+    return call(gpa, .{ .unix = cups_socket }, "localhost", "/", body, 5000) catch
         call(gpa, .{ .tcp = .{ .ip = .{ 127, 0, 0, 1 }, .port = 631 } }, "localhost", "/", body, 5000);
 }
 
 pub fn userName() []const u8 {
-    return std.posix.getenv("USER") orelse std.posix.getenv("LOGNAME") orelse "anonymous";
+    return sys.getenv("USER") orelse sys.getenv("LOGNAME") orelse "anonymous";
 }
 
 // ---------------------------------------------------------------------- tests
@@ -504,28 +476,31 @@ test "http body: content-length, chunked and 100 Continue" {
 }
 
 test "call talks HTTP to a local server" {
+    sys.initForTests();
+    const io = sys.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var server = try addr.listen(.{});
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
 
     const Srv = struct {
-        fn serve(s: *std.net.Server) void {
-            const conn = s.accept() catch return;
-            defer conn.stream.close();
+        fn serve(s: *std.Io.net.Server) void {
+            const conn = s.accept(sys.io) catch return;
+            defer conn.close(sys.io);
             var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch return;
+            _ = sys.read(conn.socket.handle, &buf, sys.milliTimestamp() + 2000) catch return;
             // status 0x0000, one printer group with printer-state = 3 (idle)
             const ipp_body = [_]u8{ 2, 0, 0, 0, 0, 0, 0, 1, 0x04, 0x23, 0, 13 } ++ "printer-state".* ++
                 [_]u8{ 0, 4, 0, 0, 0, 3, 0x03 };
             var head_buf: [128]u8 = undefined;
             const head = std.fmt.bufPrint(&head_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{ipp_body.len}) catch return;
-            conn.stream.writeAll(head) catch return;
-            conn.stream.writeAll(&ipp_body) catch return;
+            const deadline = sys.milliTimestamp() + 2000;
+            sys.writeAll(conn.socket.handle, head, deadline) catch return;
+            sys.writeAll(conn.socket.handle, &ipp_body, deadline) catch return;
         }
     };
     const t = try std.Thread.spawn(.{}, Srv.serve, .{&server});

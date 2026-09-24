@@ -3,14 +3,15 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const term = @import("term.zig");
 const app = @import("app.zig");
+const sys = @import("sys.zig");
 
-pub fn main() u8 {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const gpa = arena.allocator();
+pub fn main(init: std.process.Init) u8 {
+    // One short-lived process: everything goes in the arena, freed at exit.
+    const gpa = init.arena.allocator();
     term.arena = gpa;
+    sys.init(init.io, init.environ_map);
 
-    const args = std.process.argsAlloc(gpa) catch return 1;
+    const args = init.minimal.args.toSlice(gpa) catch return 1;
     const wants_json = for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--json")) break true;
     } else false;
@@ -22,7 +23,7 @@ pub fn main() u8 {
             term.json = true;
             term.emit(.{ .ok = false, .@"error" = err, .exit_code = 2 });
         } else {
-            term.write(std.fs.File.stderr(), "ERROR: {s}\n  see: squink --help\n", .{err});
+            term.write(std.Io.File.stderr(), "ERROR: {s}\n  see: squink --help\n", .{err});
         }
         return 2;
     };
@@ -36,6 +37,7 @@ pub fn main() u8 {
 
 test {
     std.testing.refAllDecls(@This());
+    _ = sys;
     _ = @import("proc.zig");
     _ = @import("config.zig");
     _ = @import("ipp.zig");

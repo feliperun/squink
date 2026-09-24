@@ -6,6 +6,7 @@
 //!
 //! Keys: PRINTER_QUEUE, PRINTER_URI, PRINTER_MODEL, PRINTER_IP, PRINTER_PORT, PRINTER_RP.
 const std = @import("std");
+const sys = @import("sys.zig");
 
 pub const Pair = struct { key: []const u8, value: []const u8 };
 
@@ -43,12 +44,14 @@ pub const Config = struct {
         try content.appendSlice(gpa, "# squink printer config. Written by squink; edit with care.\n");
         for (self.pairs.items) |p| try content.print(gpa, "{s}={s}\n", .{ p.key, p.value });
 
-        if (std.fs.path.dirname(self.path)) |dir| try std.fs.cwd().makePath(dir);
-        const f = try std.fs.cwd().createFile(self.path, .{ .mode = 0o600 });
-        defer f.close();
-        try f.writeAll(content.items);
+        const io = sys.io;
+        const private: std.Io.File.Permissions = .fromMode(0o600);
+        if (std.fs.path.dirname(self.path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+        const f = try std.Io.Dir.cwd().createFile(io, self.path, .{ .permissions = private });
+        defer f.close(io);
+        try f.writeStreamingAll(io, content.items);
         // createFile keeps the mode of a file that already existed.
-        try f.chmod(0o600);
+        try f.setPermissions(io, private);
         self.read_from = self.path;
     }
 };
@@ -56,15 +59,15 @@ pub const Config = struct {
 pub fn load(gpa: std.mem.Allocator) Config {
     var cfg: Config = .{ .path = defaultPath(gpa) };
     var candidates: [3]?[]const u8 = .{ cfg.path, null, null };
-    if (std.posix.getenv("SQUINK_CONFIG") == null) {
-        if (std.posix.getenv("HOME")) |home| {
+    if (sys.getenv("SQUINK_CONFIG") == null) {
+        if (sys.getenv("HOME")) |home| {
             candidates[1] = std.fs.path.join(gpa, &.{ home, ".config", "printctl", "printer.env" }) catch null;
             candidates[2] = std.fs.path.join(gpa, &.{ home, ".config", "ford", "printer.env" }) catch null;
         }
     }
     for (candidates) |c| {
         const path = c orelse continue;
-        const data = std.fs.cwd().readFileAlloc(gpa, path, 64 * 1024) catch continue;
+        const data = std.Io.Dir.cwd().readFileAlloc(sys.io, path, gpa, .limited(64 * 1024)) catch continue;
         parse(gpa, &cfg, data) catch continue;
         cfg.read_from = path;
         break;
@@ -90,11 +93,11 @@ fn parseLine(raw: []const u8) ?Pair {
 }
 
 fn defaultPath(gpa: std.mem.Allocator) []const u8 {
-    if (std.posix.getenv("SQUINK_CONFIG")) |c| return c;
-    if (std.posix.getenv("XDG_CONFIG_HOME")) |x| {
+    if (sys.getenv("SQUINK_CONFIG")) |c| return c;
+    if (sys.getenv("XDG_CONFIG_HOME")) |x| {
         if (x.len > 0) return std.fs.path.join(gpa, &.{ x, "squink", "printer.env" }) catch x;
     }
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = sys.getenv("HOME") orelse "/tmp";
     return std.fs.path.join(gpa, &.{ home, ".config", "squink", "printer.env" }) catch "printer.env";
 }
 

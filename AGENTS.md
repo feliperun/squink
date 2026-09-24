@@ -37,3 +37,5 @@ exactly one JSON object, errors included. Progress text goes to stderr.
 - `"state": "sent"` (no `--wait`) means CUPS accepted the job, not that it printed.
 - Do not retry a failed print in a loop: check `squink status --json` and report.
 - Nothing works? Run `squink status --json`, then `squink discover --json`, and show the user.
+- macOS: an error mentioning **Local Network** means macOS blocked squink. Only the user can fix
+  it (System Settings > Privacy & Security > Local Network); tell them, do not retry.

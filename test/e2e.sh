@@ -10,7 +10,8 @@
 # any printer's dialect.
 #
 # Needs: CUPS running, python3 (listener and JSON checks only), permission to run
-# lpadmin (group lpadmin or passwordless sudo). Cleans up after itself.
+# lpadmin (group lpadmin or passwordless sudo; on macOS, group _lpadmin). Runs on
+# Linux and macOS. Cleans up after itself.
 #
 # Usage: test/e2e.sh [path/to/squink]
 set -euo pipefail
@@ -27,7 +28,7 @@ STEP=0
 cleanup() {
   /usr/bin/cancel -a "${QUEUE}" 2>/dev/null || true
   /usr/sbin/lpadmin -x "${QUEUE}" 2>/dev/null || sudo -n /usr/sbin/lpadmin -x "${QUEUE}" 2>/dev/null || true
-  [[ -n "${LISTENER_PID}" ]] && kill "${LISTENER_PID}" 2>/dev/null || true
+  if [[ -n "${LISTENER_PID}" ]]; then kill "${LISTENER_PID}" 2>/dev/null; wait "${LISTENER_PID}" 2>/dev/null; fi || true
   rm -rf "${TMP}"
 }
 trap cleanup EXIT
@@ -112,7 +113,7 @@ step "status --json"
 [[ "$(json_get "['queue']['name']" < "${TMP}/status.json")" == "${QUEUE}" ]] || fail "status did not report the queue"
 
 step "bytes at the fake printer"
-BYTES=$(stat -c %s "${RECEIVED}" 2>/dev/null || echo 0)
+BYTES=$(wc -c < "${RECEIVED}" 2>/dev/null | tr -d " " || echo 0)
 echo "   received: ${BYTES} bytes"
 [[ "${BYTES}" -gt 0 ]] || fail "nothing reached the printer"
 grep -q "PRINTER_URI=socket://127.0.0.1:${PORT}" "${SQUINK_CONFIG}" || fail "config was not saved"
