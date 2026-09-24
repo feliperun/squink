@@ -2,7 +2,7 @@
 const std = @import("std");
 const proc = @import("proc.zig");
 
-pub const version = "0.2.0";
+pub const version = "0.3.0";
 
 pub const Command = enum { print, setup, status, jobs, cancel, discover, options, help, version };
 pub const Quality = enum { draft, normal, high };
@@ -399,7 +399,8 @@ pub const help_setup =
     \\  1. --ip
     \\  2. the existing queue (fast path: no network search)
     \\  3. the address saved in the config file
-    \\  4. mDNS (avahi-browse: _ipp._tcp, _ipps._tcp, _pdl-datastream._tcp)
+    \\  4. mDNS (avahi-browse on Linux, ippfind on macOS: _ipp._tcp, _ipps._tcp,
+    \\     _pdl-datastream._tcp)
     \\  5. a gentle scan of the local /24 on ports 631 and 9100 (~40 s)
     \\  A queue is only created or changed after the printer answers.
     \\
@@ -464,7 +465,7 @@ pub const help_discover =
     \\  squink discover [--scan] [--no-discover] [--json]
     \\
     \\  Shows CUPS queues, the saved config and printers announced over mDNS (each
-    \\  checked on its port: avahi answers from a cache). --scan also scans the local
+    \\  checked on its port: mDNS answers from a cache). --scan also scans the local
     \\  /24 on ports 631/9100 (~40 s). --no-discover: queues and config only.
     \\  Changes nothing.
     \\

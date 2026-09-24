@@ -2,6 +2,13 @@
 const std = @import("std");
 const proc = @import("proc.zig");
 const ipp = @import("ipp.zig");
+const sys = @import("sys.zig");
+
+/// How to join the CUPS admin group, for error messages.
+const join_lpadmin = if (sys.is_darwin)
+    "sudo dseditgroup -o edit -a $USER -t user _lpadmin"
+else
+    "sudo adduser $USER lpadmin";
 
 // lpadmin/lpinfo live in /usr/sbin, outside a regular user's PATH.
 const LP = "/usr/bin/lp";
@@ -147,7 +154,7 @@ pub fn configureQueue(
     existed: bool,
 ) ?[]const u8 {
     const argv = [_][]const u8{
-        LPADMIN, "-p", queue,       "-E", "-v", uri, "-m", driver, "-D", description,
+        LPADMIN, "-p",                      queue, "-E", "-v", uri, "-m", driver, "-D", description,
         "-o",    "printer-is-shared=false",
     };
     const r = proc.runAdmin(gpa, &argv);
@@ -160,8 +167,8 @@ pub fn configureQueue(
         return std.fmt.allocPrint(gpa,
             \\no permission to create the queue (not in group lpadmin, no passwordless sudo).
             \\  run once:  sudo {s} -p {s} -E -v {s} -m {s}
-            \\  or join the group:  sudo adduser $USER lpadmin
-        , .{ LPADMIN, queue, uri, driver }) catch t;
+            \\  or join the group:  {s}
+        , .{ LPADMIN, queue, uri, driver, join_lpadmin }) catch t;
     }
     if (std.mem.eql(u8, driver, "everywhere")) {
         return std.fmt.allocPrint(gpa,
@@ -274,8 +281,8 @@ pub const JobInfo = struct {
 };
 
 const job_attrs = [_][]const u8{
-    "job-id",                    "job-name",                 "job-state", "job-originating-user-name",
-    "time-at-creation",          "job-printer-state-message", "job-state-reasons",
+    "job-id",           "job-name",                  "job-state",         "job-originating-user-name",
+    "time-at-creation", "job-printer-state-message", "job-state-reasons",
 };
 
 fn jobFromGroup(gpa: std.mem.Allocator, queue: []const u8, g: *const ipp.Group) JobInfo {

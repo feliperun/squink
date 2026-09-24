@@ -2,7 +2,7 @@
 
 **Print from the command line, and know when the paper actually came out.**
 
-squink is a small, static, dependency-free printing CLI for Linux, written in Zig. It
+squink is a small, dependency-free printing CLI for Linux and macOS, written in Zig. It
 finds your printer on the network, sets up CUPS with the right driver, prints files,
 URLs, text or stdin, and follows the job until it is done. Every command speaks
 `--json` with stable exit codes, so scripts and AI agents can print without guessing.
@@ -17,7 +17,7 @@ waiting for the job (up to 300 s)...
 completed in 11 s
 ```
 
-- **One ~470 KB static binary.** No Python, no libc, no runtime. Runs on a 2014 laptop or a Raspberry Pi.
+- **One ~600 KB binary.** No Python, no runtime; on Linux fully static, without libc. Runs on a 2014 laptop, a Raspberry Pi or a Mac.
 - **Zero-config setup.** Finds the printer (mDNS, then a gentle LAN scan), asks it for its model over IPP, picks the installed driver that matches, creates the queue. Only after the printer answers: no phantom queues.
 - **`--wait`** follows the job in CUPS and exits `0` when it printed, `1` when it failed, `3` when it is still stuck.
 - **`status`** asks the printer itself: ready or not, alerts (paper out, jam...), ink levels when the printer reports them.
@@ -27,15 +27,19 @@ completed in 11 s
 ## Install
 
 Download a binary from the [releases](https://github.com/feliperun/squink/releases)
-(x86_64, aarch64, armv7, riscv64), or build it (Zig 0.15.2):
+(Linux x86_64, aarch64, armv7, riscv64; macOS arm64 and x86_64), or build it (Zig 0.16):
 
 ```bash
 git clone https://github.com/feliperun/squink && cd squink
-zig build --release -Dtarget=x86_64-linux     # or aarch64-linux, arm-linux-musleabihf, riscv64-linux
+zig build --release                           # this machine (Linux or macOS)
+zig build --release -Dtarget=aarch64-linux    # or x86_64-linux, arm-linux-musleabihf, riscv64-linux,
+                                              #    aarch64-macos, x86_64-macos
 sudo install -m 755 zig-out/bin/squink /usr/local/bin/
 ```
 
-squink drives CUPS, so the machine needs it:
+squink drives CUPS, so the machine needs it.
+
+**Linux:**
 
 ```bash
 sudo apt-get install cups avahi-utils curl     # Debian/Ubuntu
@@ -45,6 +49,15 @@ sudo adduser $USER lpadmin                     # create queues without sudo (nex
 `avahi-utils` is optional (without it discovery goes straight to the scan) and `curl` is
 only used by `print --url`. Some printers also need their vendor driver; see
 [Printers](#printers).
+
+**macOS:** CUPS, `ippfind` (mDNS) and `curl` come with the system, and admin accounts
+are already in the `_lpadmin` group. Two things to know:
+
+- macOS 15+ asks for **Local Network** permission before an app talks to devices on
+  the LAN. Allow it for the terminal that runs squink (System Settings > Privacy &
+  Security > Local Network). Without it every printer looks unreachable, and squink
+  says so.
+- A binary downloaded with a browser is quarantined: `xattr -d com.apple.quarantine squink`.
 
 ## Quick start
 
@@ -124,7 +137,7 @@ $ squink print missing.pdf --json
 1. `--ip`
 2. the existing CUPS queue (fast path: no network traffic beyond one connect)
 3. the address saved in `~/.config/squink/printer.env`
-4. mDNS via `avahi-browse` (`_ipp._tcp`, `_ipps._tcp`, `_pdl-datastream._tcp`), each result checked on its port, because avahi answers from a cache
+4. mDNS (`_ipp._tcp`, `_ipps._tcp`, `_pdl-datastream._tcp`) via `avahi-browse` on Linux and `ippfind` on macOS, each result checked on its port, because mDNS answers from a cache
 5. a scan of the local /24 on ports 631 and 9100, 16 connections at a time with jitter (~40 s). Cheap network stacks in printers fall over under aggressive scans.
 
 **Choosing the driver:**
@@ -142,7 +155,7 @@ address saved.
 
 | Printer | Status | Notes |
 |---|---|---|
-| Epson L3250 (EcoTank) | Tested | Needs `printer-driver-escpr`; driverless fails. No ink levels over IPP. |
+| Epson L3250 (EcoTank) | Tested | Linux: needs `printer-driver-escpr`; driverless fails. No ink levels over IPP. |
 | Any IPP Everywhere / AirPrint printer | Should work | Driverless, no extra packages. |
 | Printers with a CUPS driver installed | Should work | The driver is picked from `lpinfo -m` by model. |
 
@@ -186,10 +199,11 @@ zig build --release && test/e2e.sh   # end to end against real CUPS with a fake 
 
 `test/e2e.sh` starts a TCP listener as the printer, lets squink create a queue for it and
 checks print, `--wait` (completed and timeout), `jobs`, `cancel` and `--json`. It needs
-CUPS and `lpadmin` permission, and cleans up after itself.
+CUPS and `lpadmin` permission, runs on Linux and macOS, and cleans up after itself.
 
 Code map: `cli.zig` (flags and help), `app.zig` (commands), `ipp.zig` (IPP and HTTP/TLS),
-`discover.zig` (mDNS, scan), `cups.zig` (queues, drivers, jobs), `config.zig`.
+`discover.zig` (mDNS, scan), `cups.zig` (queues, drivers, jobs), `config.zig`, `sys.zig`
+(the `std.Io` instance, environment, clocks, sockets with deadlines).
 
 ## License
 

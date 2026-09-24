@@ -7,6 +7,7 @@ const config = @import("config.zig");
 const discover = @import("discover.zig");
 const cups = @import("cups.zig");
 const ipp = @import("ipp.zig");
+const sys = @import("sys.zig");
 
 const Printer = discover.Printer;
 const Opts = cli.Opts;
@@ -19,7 +20,7 @@ pub const exit_timeout: u8 = 3;
 pub fn run(gpa: Allocator, o: Opts) u8 {
     return switch (o.command) {
         .help => {
-            term.write(std.fs.File.stdout(), "{s}", .{cli.helpFor(o.help_topic)});
+            term.write(std.Io.File.stdout(), "{s}", .{cli.helpFor(o.help_topic)});
             term.emitted = true; // help is text even with --json
             return exit_ok;
         },
@@ -111,7 +112,7 @@ fn resolve(gpa: Allocator, o: Opts) ?Resolved {
 
     const preferred = o.model orelse cfg.get("PRINTER_MODEL") orelse "";
 
-    // 4. mDNS. avahi answers from a cache: only what answers on its port counts.
+    // 4. mDNS. It answers from a cache: only what answers on its port counts.
     term.info("searching via mDNS...\n", .{});
     if (pick(discover.mdns(gpa), preferred)) |p| return ensure(gpa, o, &cfg, saved_queue, p);
 
@@ -121,7 +122,7 @@ fn resolve(gpa: Allocator, o: Opts) ?Resolved {
 
     term.fail("no printer found on the network.\n" ++
         "  - check that it is on and on the same network (many printers only join 2.4 GHz Wi-Fi)\n" ++
-        "  - or pass its address:  squink setup --ip <IP>", .{});
+        "  - or pass its address:  squink setup --ip <IP>{s}", .{sys.lanHint()});
     return null;
 }
 
@@ -173,7 +174,7 @@ fn ensure(gpa: Allocator, o: Opts, cfg: *config.Config, queue_opt: ?[]const u8, 
     // Never touch CUPS unless the printer answers: no phantom queues.
     if (!discover.reachable(p, 3000)) {
         term.fail("printer unreachable: {s}:{d} does not answer.\n" ++
-            "  check that it is on and on the same network, or pass the right --ip <IP>", .{ ip, p.port });
+            "  check that it is on and on the same network, or pass the right --ip <IP>{s}", .{ ip, p.port, sys.lanHint() });
         return null;
     }
     if (o.model) |m| {
@@ -191,7 +192,7 @@ fn ensure(gpa: Allocator, o: Opts, cfg: *config.Config, queue_opt: ?[]const u8, 
     if (current != null and std.mem.eql(u8, current.?, uri) and o.driver == null) {
         revive(gpa, o, queue);
     } else {
-        const driver = o.driver orelse std.posix.getenv("SQUINK_DRIVER") orelse cups.findDriver(gpa, p.model) orelse
+        const driver = o.driver orelse sys.getenv("SQUINK_DRIVER") orelse cups.findDriver(gpa, p.model) orelse
             if (p.scheme == .ipp) "everywhere" else {
                 term.fail("no driver found for \"{s}\", and driverless printing needs IPP (this is {s}).\n" ++
                     "  pass --model \"MAKE MODEL\" or --driver <first column of lpinfo -m>", .{ p.model, uri });
@@ -267,7 +268,7 @@ fn cmdPrint(gpa: Allocator, o: Opts) u8 {
     var stdin_data: ?[]const u8 = null;
     var name: []const u8 = "squink";
     var temp: ?[]const u8 = null;
-    defer if (temp) |p| std.fs.cwd().deleteFile(p) catch {};
+    defer if (temp) |p| std.Io.Dir.cwd().deleteFile(sys.io, p) catch {};
 
     if (o.url) |url| {
         temp = download(gpa, url) orelse return exit_fail;
@@ -281,7 +282,7 @@ fn cmdPrint(gpa: Allocator, o: Opts) u8 {
         name = "stdin";
     } else {
         for (o.files) |f| {
-            const st = std.fs.cwd().statFile(f) catch {
+            const st = std.Io.Dir.cwd().statFile(sys.io, f, .{}) catch {
                 term.fail("file not found: {s}", .{f});
                 return exit_fail;
             };
@@ -410,12 +411,12 @@ const Waited = struct { code: u8, state: []const u8, message: []const u8, elapse
 /// Follows a job until it leaves the queue or time runs out.
 fn waitJob(gpa: Allocator, queue: []const u8, number: u32, timeout_s: u32) Waited {
     term.info("waiting for the job (up to {d} s)...\n", .{timeout_s});
-    const start = std.time.timestamp();
+    const start = sys.timestamp();
     var last_state: []const u8 = "";
     var last_message: []const u8 = "";
     var misses: u8 = 0;
     while (true) {
-        const elapsed = std.time.timestamp() - start;
+        const elapsed = sys.timestamp() - start;
         if (cups.job(gpa, queue, number)) |j| {
             misses = 0;
             if (!std.mem.eql(u8, j.state, last_state) or !std.mem.eql(u8, j.message, last_message)) {
@@ -445,15 +446,15 @@ fn waitJob(gpa: Allocator, queue: []const u8, number: u32, timeout_s: u32) Waite
             });
             return .{ .code = exit_timeout, .state = last_state, .message = last_message, .elapsed_s = elapsed };
         }
-        std.Thread.sleep(std.time.ns_per_s);
+        sys.sleepMs(1000);
     }
 }
 
 fn readStdin(gpa: Allocator) ?[]const u8 {
-    const in = std.fs.File.stdin();
-    if (in.isTty()) term.info("reading from the keyboard; finish with Ctrl+D\n", .{});
+    const in = std.Io.File.stdin();
+    if (in.isTty(sys.io) catch false) term.info("reading from the keyboard; finish with Ctrl+D\n", .{});
     var buf: [4096]u8 = undefined;
-    var r = in.reader(&buf);
+    var r = in.readerStreaming(sys.io, &buf);
     const data = r.interface.allocRemaining(gpa, .limited(64 << 20)) catch |e| {
         term.fail("reading stdin: {s}", .{@errorName(e)});
         return null;
@@ -467,20 +468,20 @@ fn readStdin(gpa: Allocator) ?[]const u8 {
 
 /// Downloads with curl to a private temp file. Returns its path, or null.
 fn download(gpa: Allocator, url: []const u8) ?[]const u8 {
-    const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
+    const tmpdir = sys.getenv("TMPDIR") orelse "/tmp";
     var rand: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand);
+    sys.randomBytes(&rand);
     const path = std.fmt.allocPrint(gpa, "{s}/squink-url-{x}", .{ tmpdir, rand }) catch return null;
-    const f = std.fs.cwd().createFile(path, .{ .exclusive = true, .mode = 0o600 }) catch |e| {
+    const f = std.Io.Dir.cwd().createFile(sys.io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch |e| {
         term.fail("could not create {s}: {s}", .{ path, @errorName(e) });
         return null;
     };
-    f.close();
+    f.close(sys.io);
 
     term.info("downloading {s}\n", .{url});
     const r = proc.run(gpa, &.{ "curl", "-fsSL", "--proto", "=http,https", "--max-time", "60", "-o", path, "--", url });
     if (!r.ok()) {
-        std.fs.cwd().deleteFile(path) catch {};
+        std.Io.Dir.cwd().deleteFile(sys.io, path) catch {};
         if (r.code == 127) term.fail("curl not found (install it: sudo apt-get install curl)", .{}) else term.fail("download failed: {s}", .{r.text(gpa)});
         return null;
     }
@@ -492,7 +493,7 @@ fn nameFromUrl(url: []const u8) []const u8 {
     const no_scheme = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
     const path = no_scheme[std.mem.indexOfScalar(u8, no_scheme, '/') orelse return "url" ..];
     const no_query = path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
-    const clean = std.mem.trimRight(u8, no_query, "/");
+    const clean = std.mem.trimEnd(u8, no_query, "/");
     const last = clean[(std.mem.lastIndexOfScalar(u8, clean, '/') orelse return "url") + 1 ..];
     return if (last.len > 0) last else "url";
 }
@@ -534,8 +535,8 @@ fn cmdStatus(gpa: Allocator, o: Opts) u8 {
         reachable = discover.portOpen(t.ip, t.port, 3000);
         // Ask over IPP even for socket:// queues: most printers also speak IPP on 631.
         const attrs = if (reachable) discover.printerAttributes(gpa, t.ip, 631, if (t.socket) "ipp/print" else t.rp, &.{
-            "printer-make-and-model", "printer-state",  "printer-state-reasons", "printer-state-message",
-            "marker-names",           "marker-levels",  "marker-colors",
+            "printer-make-and-model", "printer-state", "printer-state-reasons", "printer-state-message",
+            "marker-names",           "marker-levels", "marker-colors",
         }) else null;
         if (attrs) |resp| if (resp.first(ipp.tag.printer_group)) |g| {
             if (g.str("printer-make-and-model")) |m| model = m;
@@ -594,14 +595,14 @@ fn cmdStatus(gpa: Allocator, o: Opts) u8 {
         if (queue_uri) |u| {
             if (qstate) |s| {
                 term.info("queue:    {s} -> {s}\n          {s}, {s}, {d} job(s) waiting{s}{s}\n", .{
-                    queue.?, u, s.state, if (s.accepting) "accepting jobs" else "NOT accepting jobs", s.jobs,
-                    if (s.message.len > 0) " - " else "",                        s.message,
+                    queue.?,                              u,         s.state, if (s.accepting) "accepting jobs" else "NOT accepting jobs", s.jobs,
+                    if (s.message.len > 0) " - " else "", s.message,
                 });
             } else term.info("queue:    {s} -> {s} (CUPS did not answer)\n", .{ queue.?, u });
         } else term.info("queue:    none yet (squink setup creates it)\n", .{});
         term.info("printer:  {s}{s}{s}\n", .{ if (model.len > 0) model else "unknown model", if (ip_s != null) " at " else "", ip_s orelse "" });
         if (!reachable) {
-            term.info("          NOT REACHABLE (off, asleep, or on another network)\n", .{});
+            term.info("          NOT REACHABLE (off, asleep, or on another network){s}\n", .{sys.lanHint()});
         } else {
             term.info("          {s}{s}{s}\n", .{ state, if (message.len > 0) " - " else "", message });
         }
@@ -752,9 +753,10 @@ fn cmdDiscover(gpa: Allocator, o: Opts) u8 {
     if (announced.items.len == 0) term.info("  (nothing announcing a printer)\n", .{});
     for (announced.items) |p| {
         term.info("  {s:<28} {s:<16} {s}  [{s}]{s}\n", .{
-            p.name, p.ip, p.model, p.source, if (p.reachable.?) "" else "  NOT ANSWERING (stale avahi cache?)",
+            p.name, p.ip, p.model, p.source, if (p.reachable.?) "" else "  NOT ANSWERING (stale mDNS cache?)",
         });
     }
+    if (sys.lan_blocked) term.info("{s}\n", .{sys.lanHint()});
     if (o.scan) {
         term.info("\n=== local network scan (631/9100) ===\n", .{});
         if (scanned.items.len == 0) term.info("  (no host with a printer port open)\n", .{});

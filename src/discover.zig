@@ -1,7 +1,7 @@
-//! Finding printers on the network: mDNS (avahi-browse), a gentle /24 scan, and an
-//! IPP query that tells the make and model of an address.
+//! Finding printers on the network: mDNS (avahi-browse on Linux, ippfind on macOS),
+//! a gentle /24 scan, and an IPP query that tells the make and model of an address.
 const std = @import("std");
-const posix = std.posix;
+const sys = @import("sys.zig");
 const proc = @import("proc.zig");
 const ipp = @import("ipp.zig");
 
@@ -35,20 +35,7 @@ pub const Printer = struct {
 
 /// TCP connect with a timeout. Closes right away; sends nothing.
 pub fn portOpen(ip: [4]u8, port: u16, timeout_ms: i32) bool {
-    const addr = std.net.Address.initIp4(ip, port);
-    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch
-        return false;
-    defer posix.close(fd);
-
-    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |e| switch (e) {
-        error.WouldBlock => {},
-        else => return false,
-    };
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-    const n = posix.poll(&fds, timeout_ms) catch return false;
-    if (n == 0) return false;
-    posix.getsockoptError(fd) catch return false;
-    return true;
+    return sys.portOpen(ip, port, timeout_ms);
 }
 
 pub fn reachable(p: Printer, timeout_ms: i32) bool {
@@ -93,9 +80,9 @@ pub fn printerAttributes(
 
 /// Diagnostics for SQUINK_DEBUG=1.
 pub fn debug(comptime fmt: []const u8, args: anytype) void {
-    if (std.posix.getenv("SQUINK_DEBUG") == null) return;
+    if (sys.getenv("SQUINK_DEBUG") == null) return;
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.stderr().writerStreaming(sys.io, &buf);
     w.interface.print("debug: " ++ fmt ++ "\n", args) catch {};
     w.interface.flush() catch {};
 }
@@ -106,11 +93,13 @@ pub fn debug(comptime fmt: []const u8, args: anytype) void {
 /// wins, so IPP (what the queue uses) beats raw port 9100.
 const mdns_types = [_][]const u8{ "_ipp._tcp", "_ipps._tcp", "_pdl-datastream._tcp" };
 
-/// Printers announced over mDNS, one per address. Empty without avahi-browse.
+/// Printers announced over mDNS, one per address. Empty without avahi-browse
+/// (Linux) or ippfind (macOS).
 ///
 /// WARNING: avahi-daemon answers from its cache, so a printer that just left the
 /// network keeps showing up here. Check the port before trusting a result.
 pub fn mdns(gpa: std.mem.Allocator) []Printer {
+    if (sys.is_darwin) return mdnsIppfind(gpa);
     var found: std.ArrayList(Printer) = .empty;
     for (mdns_types) |t| {
         // -k keeps raw service types (_ipp._tcp); without it avahi prints "Internet Printer".
@@ -124,6 +113,63 @@ pub fn mdns(gpa: std.mem.Allocator) []Printer {
         }
     }
     return found.items;
+}
+
+/// Field separator in ippfind's output: a byte that no printer name contains.
+const us = "\x1f";
+
+/// macOS: `ippfind` (ships with the system's CUPS) browses all types at once and
+/// stops by itself; the system resolver turns the `.local` host into an address.
+fn mdnsIppfind(gpa: std.mem.Allocator) []Printer {
+    const r = proc.run(gpa, &.{
+        "/usr/bin/ippfind",                                                                                               "-T", "5", "_ipp._tcp", "_ipps._tcp", "_pdl-datastream._tcp", "-x", "/bin/echo",
+        "{service_port}" ++ us ++ "{service_name}" ++ us ++ "{service_hostname}" ++ us ++ "{txt_rp}" ++ us ++ "{txt_ty}", ";",
+    });
+    if (!r.ok()) return &.{};
+
+    var found: std.ArrayList(Printer) = .empty;
+    // One pass per type, in order of preference, as on Linux.
+    for (mdns_types) |t| {
+        var lines = std.mem.splitScalar(u8, r.stdout, '\n');
+        while (lines.next()) |line| {
+            const f = parseIppfind(line) orelse continue;
+            if (!std.mem.eql(u8, f.service, t)) continue;
+            const ip = proc.parseIp(f.host) orelse sys.resolveIp4(gpa, f.host) orelse continue;
+            if (indexByIp(found.items, ip) != null) continue;
+            var p: Printer = .{
+                .name = f.name,
+                .ip = ip,
+                .port = f.port,
+                .model = f.ty,
+                .source = std.fmt.allocPrint(gpa, "mdns:{s}", .{t}) catch "mdns",
+            };
+            if (std.mem.eql(u8, t, "_pdl-datastream._tcp")) {
+                p.scheme = .socket;
+            } else {
+                p.rp = std.mem.trim(u8, f.rp, "/");
+                if (p.rp.len == 0) p.rp = "ipp/print";
+            }
+            found.append(gpa, p) catch {};
+        }
+    }
+    return found.items;
+}
+
+const IppfindLine = struct { service: []const u8, port: u16, name: []const u8, host: []const u8, rp: []const u8, ty: []const u8 };
+
+/// PORT US NAME US HOST US RP US TY. ippfind's {service_regtype} does not exist and
+/// its {service_scheme} says "lpd" for 9100, so the type comes from port and TXT.
+fn parseIppfind(raw: []const u8) ?IppfindLine {
+    const line = std.mem.trimStart(u8, std.mem.trim(u8, raw, "\r"), "=");
+    var it = std.mem.splitSequence(u8, line, us);
+    const port = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
+    const name = it.next() orelse return null;
+    const host = std.mem.trimEnd(u8, it.next() orelse return null, ".");
+    const rp = it.next() orelse return null;
+    const ty = it.next() orelse return null;
+    if (host.len == 0) return null;
+    const service = if (port == 9100) "_pdl-datastream._tcp" else if (rp.len > 0 or port == 631) "_ipp._tcp" else return null;
+    return .{ .service = service, .port = port, .name = name, .host = host, .rp = rp, .ty = ty };
 }
 
 fn indexByIp(list: []const Printer, ip: [4]u8) ?usize {
@@ -214,11 +260,13 @@ const Scan = struct {
     found: [255]u16 = @splat(0),
 
     fn work(self: *Scan) void {
-        var prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
+        var seed: [8]u8 = undefined;
+        sys.randomBytes(&seed);
+        var prng = std.Random.DefaultPrng.init(std.mem.readInt(u64, &seed, .little));
         while (true) {
             const h = self.next.fetchAdd(1, .monotonic);
             if (h > 254) return;
-            std.Thread.sleep(prng.random().uintLessThan(u64, 250) * std.time.ns_per_ms);
+            sys.sleepMs(prng.random().uintLessThan(u64, 250));
             const ip = [4]u8{ self.base[0], self.base[1], self.base[2], @intCast(h) };
             for (scan_ports) |port| {
                 if (portOpen(ip, port, 1200)) {
@@ -232,7 +280,7 @@ const Scan = struct {
 
 /// Hosts on the local /24 (this machine's default-route address) with a printer port open.
 pub fn scan(gpa: std.mem.Allocator) []Printer {
-    const me = localIp() orelse return &.{};
+    const me = sys.localIp() orelse return &.{};
     var s: Scan = .{ .base = me[0..3].* };
 
     var threads: [workers]?std.Thread = @splat(null);
@@ -252,18 +300,6 @@ pub fn scan(gpa: std.mem.Allocator) []Printer {
         }) catch {};
     }
     return found.items;
-}
-
-/// IPv4 address of the default-route interface. A UDP connect sends no packet.
-fn localIp() ?[4]u8 {
-    const fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0) catch return null;
-    defer posix.close(fd);
-    const dst = std.net.Address.initIp4(.{ 1, 1, 1, 1 }, 80);
-    posix.connect(fd, &dst.any, dst.getOsSockLen()) catch return null;
-    var local: std.net.Address = undefined;
-    var len: posix.socklen_t = @sizeOf(std.net.Address);
-    posix.getsockname(fd, &local.any, &len) catch return null;
-    return @bitCast(local.in.sa.addr);
 }
 
 // ----------------------------------------------------------------------- tests
@@ -296,11 +332,26 @@ test "parseAvahi: 9100 becomes socket, IPv6 and unresolved lines are skipped" {
     try std.testing.expect(parseAvahi(gpa, "") == null);
 }
 
+test "parseIppfind reads the lines macOS prints for an L3250" {
+    const ipp_line = parseIppfind("631" ++ us ++ "EPSON L3250 Series" ++ us ++ "EPSON66C78E.local." ++ us ++ "ipp/print" ++ us ++ "EPSON L3250 Series").?;
+    try std.testing.expectEqualStrings("_ipp._tcp", ipp_line.service);
+    try std.testing.expectEqualStrings("EPSON66C78E.local", ipp_line.host);
+    try std.testing.expectEqualStrings("ipp/print", ipp_line.rp);
+    try std.testing.expectEqualStrings("EPSON L3250 Series", ipp_line.ty);
+    const raw = parseIppfind("=9100" ++ us ++ "EPSON" ++ us ++ "E.local" ++ us ++ "" ++ us ++ "EPSON L3250").?;
+    try std.testing.expectEqualStrings("_pdl-datastream._tcp", raw.service);
+    try std.testing.expectEqual(@as(u16, 9100), raw.port);
+    try std.testing.expect(parseIppfind("") == null);
+    try std.testing.expect(parseIppfind("abc" ++ us ++ "x") == null);
+}
+
 test "portOpen sees a local listener and not a closed port" {
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var srv = try addr.listen(.{});
-    const port = srv.listen_address.getPort();
+    sys.initForTests();
+    const io = sys.io;
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var srv = try addr.listen(io, .{});
+    const port = srv.socket.address.getPort();
     try std.testing.expect(portOpen(.{ 127, 0, 0, 1 }, port, 500));
-    srv.deinit();
+    srv.deinit(io);
     try std.testing.expect(!portOpen(.{ 127, 0, 0, 1 }, port, 500));
 }
