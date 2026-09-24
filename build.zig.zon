@@ -1,0 +1,14 @@
+.{
+    .name = .squink,
+    .version = "0.2.0",
+    .fingerprint = 0xc23f494bed212741,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}

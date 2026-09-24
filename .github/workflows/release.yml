@@ -1,0 +1,33 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - run: zig build test
+      - name: build static binaries
+        run: |
+          mkdir dist
+          for t in x86_64-linux aarch64-linux arm-linux-musleabihf riscv64-linux; do
+            zig build --release -Dtarget=$t --prefix out/$t
+            name="squink-${GITHUB_REF_NAME}-${t}"
+            mkdir "$name"
+            cp out/$t/bin/squink README.md AGENTS.md LICENSE "$name"/
+            tar czf "dist/$name.tar.gz" "$name"
+          done
+          cd dist && sha256sum *.tar.gz > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
